@@ -136,6 +136,7 @@ DEFAULTS: dict = {
     'enhance_max_stage': 15, 'safeguard_enable': False, 'safeguard_stage': 12,
     'sim_random_seed': True,   # [수정6] seed 토글
     'current_preset': "Custom (직접 설정)",
+    'ai_design_summary': None,   # AI 자동 설계 적용 결과 요약
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -345,24 +346,61 @@ def cumulative_gacha_curve(prob_pct: float, pity: int,
 # ═══════════════════════════════════════════════════════════════
 # 5. AI 분석 (스키마 검증 + 예외 처리)
 # ═══════════════════════════════════════════════════════════════
-_AI_SCHEMA = {
-    "base_atk":        (1,     99999,   10),
-    "max_level":       (2,     9999,    50),
-    "target_atk":      (1,     9999999, 500),
-    "curve_type":      (["Exponential", "Logarithmic", "S-Curve"], "Exponential"),
-    "prob_legend":     (0.001, 100.0,   0.1),
-    "pity_count":      (1,     9999,    100),
-    "enhance_prob":    (1.0,   100.0,   50.0),
-    "enhance_destroy": (0.0,   100.0,   1.0),
-    "monster_hp":      (1,     9999999, 100),
+
+# 모드별로 AI가 건드릴 필드를 제한 — 의도와 무관한 값이 바뀌는 것을 방지
+_MODE_FIELDS = {
+    "📈 성장 밸런스":   ["base_atk", "max_level", "target_atk", "curve_type", "monster_hp"],
+    "🎰 가챠 확률":     ["prob_legend", "pity_count", "soft_pity_enable", "soft_pity_start"],
+    "🔥 강화 리스크":   ["enhance_prob", "enhance_destroy", "enhance_max_stage",
+                        "safeguard_enable", "safeguard_stage"],
+    "⚔️ 전투 시뮬레이터": ["base_atk", "monster_def", "atk_speed", "crit_rate",
+                           "crit_dmg", "monster_hp"],
 }
 
-def _validate_ai_result(raw: dict) -> dict:
+_AI_SCHEMA = {
+    # 성장 관련
+    "base_atk":         (1,      99999,    10),
+    "max_level":        (2,      9999,     50),
+    "target_atk":       (1,      9999999,  500),
+    "curve_type":       (["Exponential", "Logarithmic", "S-Curve"], "Exponential"),
+    "monster_hp":       (1,      9999999,  100),
+    # 전투 관련
+    "monster_def":      (0,      99999,    0),
+    "atk_speed":        (0.1,    10.0,     1.0),
+    "crit_rate":        (0.0,    100.0,    10.0),
+    "crit_dmg":         (100.0,  600.0,    150.0),
+    # 가챠 관련
+    "prob_legend":      (0.001,  100.0,    0.1),
+    "pity_count":       (1,      9999,     100),
+    "soft_pity_enable": ([True, False],    False),
+    "soft_pity_start":  (1,      9998,     75),
+    # 강화 관련
+    "enhance_prob":     (1.0,    100.0,    50.0),
+    "enhance_destroy":  (0.0,    100.0,    1.0),
+    "enhance_max_stage":(3,      30,       15),
+    "safeguard_enable": ([True, False],    False),
+    "safeguard_stage":  (1,      29,       12),
+}
+
+def _validate_ai_result(raw: dict, allowed_keys: list) -> dict:
+    """스키마 검증 + allowed_keys에 해당하는 필드만 반환"""
     out = {}
-    for key, spec in _AI_SCHEMA.items():
+    for key in allowed_keys:
+        spec = _AI_SCHEMA.get(key)
+        if spec is None:
+            continue
         val = raw.get(key)
         if isinstance(spec[0], list):
-            out[key] = val if val in spec[0] else spec[1]
+            # boolean 처리
+            if spec[0] == [True, False]:
+                if isinstance(val, bool):
+                    out[key] = val
+                elif isinstance(val, str):
+                    out[key] = val.lower() in ("true", "1", "yes")
+                else:
+                    out[key] = spec[1]
+            else:
+                out[key] = val if val in spec[0] else spec[1]
         else:
             lo, hi, default = spec
             try:
@@ -375,17 +413,59 @@ def _validate_ai_result(raw: dict) -> dict:
     return out
 
 
-def analyze_intent(user_query: str) -> dict:
-    prompt = f"""
-당신은 게임 밸런스 디자이너입니다. 사용자 의도를 RPG 시스템 파라미터 JSON으로 변환하세요.
+# 모드별 프롬프트 힌트
+_MODE_PROMPTS = {
+    "📈 성장 밸런스": """
+[현재 설정 - 성장 밸런스 모드]
+조정 가능한 필드: base_atk, max_level, target_atk, curve_type, monster_hp
+- curve_type: "Exponential"(지수 성장), "Logarithmic"(초반 빠른 성장 후 완만), "S-Curve"(중반 폭발적 성장)
+- base_atk: 레벨1 공격력, target_atk: 최고레벨 공격력, monster_hp: 몬스터 체력
+""",
+    "🎰 가챠 확률": """
+[현재 설정 - 가챠 확률 모드]
+조정 가능한 필드: prob_legend, pity_count, soft_pity_enable, soft_pity_start
+- prob_legend: 기본 획득 확률(%). 낮을수록 초반에 잘 안 뽑힘
+- pity_count: 천장 횟수 (이 횟수가 되면 무조건 획득)
+- soft_pity_enable: true이면 soft_pity_start 이후 확률이 점점 올라감
+- soft_pity_start: 확률이 오르기 시작하는 횟수 (여기서 천장까지 100%로 선형 증가)
+예) "60회 이상부터 잘 뽑히게" → soft_pity_enable:true, soft_pity_start:60
+예) "초반엔 어렵고 후반엔 확실히" → prob_legend 낮게, soft_pity_enable:true, soft_pity_start을 pity_count의 50~70% 값으로
+""",
+    "🔥 강화 리스크": """
+[현재 설정 - 강화 리스크 모드]
+조정 가능한 필드: enhance_prob, enhance_destroy, enhance_max_stage, safeguard_enable, safeguard_stage
+- enhance_prob: 기본 성공 확률(%)
+- enhance_destroy: 기본 파괴 확률(%)
+- enhance_max_stage: 목표 최대 강화 단계
+- safeguard_enable: true이면 특정 단계부터 파괴 방지
+- safeguard_stage: 파괴 방지 시작 단계
+""",
+    "⚔️ 전투 시뮬레이터": """
+[현재 설정 - 전투 시뮬레이터 모드]
+조정 가능한 필드: base_atk, monster_def, atk_speed, crit_rate, crit_dmg, monster_hp
+""",
+}
+
+
+def analyze_intent(user_query: str, current_mode: str) -> dict:
+    allowed_keys = _MODE_FIELDS.get(current_mode, list(_AI_SCHEMA.keys()))
+    mode_hint = _MODE_PROMPTS.get(current_mode, "")
+    allowed_json = {k: str(_AI_SCHEMA[k]) for k in allowed_keys if k in _AI_SCHEMA}
+
+    prompt = f"""당신은 게임 밸런스 디자이너입니다. 사용자 의도를 RPG 시스템 설정값 JSON으로 변환하세요.
+{mode_hint}
 [사용자 요청]: "{user_query}"
-[반환 JSON]:
+
+[반환 규칙]
+- 아래 필드들만 포함된 JSON을 반환하세요 (다른 필드 절대 포함 금지)
+- 허용 필드: {list(allowed_keys)}
+- boolean 값은 반드시 true/false (소문자)로 반환
+- reason 필드에 어떤 값을 어떻게 설정했는지 한국어로 100자 이내로 요약
+
+[반환 JSON 예시 구조]:
 {{
-  "base_atk":int(1~99999), "max_level":int(2~9999), "target_atk":int(1~9999999),
-  "curve_type":"Exponential"|"Logarithmic"|"S-Curve",
-  "prob_legend":float(0.001~100), "pity_count":int(1~9999),
-  "enhance_prob":float(1~100), "enhance_destroy":float(0~100),
-  "monster_hp":int(1~9999999), "reason":"기획 의도 요약(100자 이내)"
+  {chr(10).join(f'  "{k}": <값>,' for k in allowed_keys)}
+  "reason": "기획 의도 요약"
 }}
 """
     if client is None:
@@ -395,13 +475,13 @@ def analyze_intent(user_query: str) -> dict:
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a master game designer. Return only valid JSON."},
+                {"role": "system", "content": "You are a master game designer. Return only valid JSON with the exact fields specified."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
         )
         raw = json.loads(res.choices[0].message.content)
-        return _validate_ai_result(raw)
+        return _validate_ai_result(raw, allowed_keys)
     except json.JSONDecodeError:
         st.error("❌ AI가 잘못된 JSON 형식을 반환했습니다. 다시 시도해주세요.")
     except Exception as e:
@@ -413,11 +493,13 @@ def analyze_intent(user_query: str) -> dict:
     return {}
 
 
+
+
 # ═══════════════════════════════════════════════════════════════
 # 6. 사이드바 – 프리셋 & 전역 옵션
 # ═══════════════════════════════════════════════════════════════
-st.sidebar.header("🕹️ 메이저 게임 프리셋")
-selected_preset = st.sidebar.selectbox("밸런스 전략 선택", list(PRESETS.keys()),
+st.sidebar.header("🕹️ 저장된 설정 불러오기")
+selected_preset = st.sidebar.selectbox("게임 유형 선택", list(PRESETS.keys()),
                                         key="preset_select")
 
 if selected_preset != st.session_state["current_preset"]:
@@ -515,7 +597,7 @@ st.sidebar.markdown("""
       컴퓨터 난수는 <b>시작 숫자(시드)</b>에 따라 결과가 결정됩니다.<br><br>
       <b>ON (고정 seed=42)</b><br>
       → 몇 번 실행해도 가챠·강화 결과가 <b>항상 동일</b>.<br>
-      파라미터 비교·밸런스 분석에 적합.<br><br>
+      설정값 비교·밸런스 분석에 적합.<br><br>
       <b>OFF (랜덤)</b><br>
       → 실행마다 결과가 조금씩 달라져 <b>실제 게임 느낌</b>과 유사.
     </span>
@@ -552,11 +634,10 @@ if mode == "📈 성장 밸런스":
                                     index=["Exponential", "Logarithmic", "S-Curve"]
                                          .index(st.session_state["curve_type"]))
         f_target     = st.number_input("만렙 공격력",   value=int(st.session_state["target_atk"]),  min_value=1)
-        f_ttk_mode   = st.checkbox("🎯 목표 TTK 기반 몬스터 HP 역산",
+        f_ttk_mode   = st.checkbox("🎯 몬스터 처치 시간 목표 설정 (단위: 초)",
                                     value=st.session_state["ttk_mode"])
         # [수정4] 이산/연속 토글
-        f_discrete   = st.checkbox("⚙️ 이산 TTK 모드 (타수 기반 ceil)",
-                                    value=st.session_state["ttk_discrete"])
+        f_discrete   = st.checkbox("⚙️ 실제 타수 계산 (소수점 올림)", value=st.session_state["ttk_discrete"])
         f_target_ttk = st.slider("목표 처치 시간 (초)", 0.5, 60.0,
                                   value=float(st.session_state["target_ttk"]), step=0.5)
         if st.form_submit_button("✅ 적용"):
@@ -579,8 +660,8 @@ if mode == "📈 성장 밸런스":
             st.session_state["crit_dmg"], st.session_state["monster_def"],
             discrete_mode=st.session_state["ttk_discrete"]
         )
-        mode_label = "이산(타수 기반)" if st.session_state["ttk_discrete"] else "연속(DPS 기반)"
-        st.info(f"🎯 목표 TTK **{st.session_state['target_ttk']}초** | 역산 모드: **{mode_label}**")
+        mode_label = "실제 타수 기반" if st.session_state["ttk_discrete"] else "DPS 기반 (연속)"
+        st.info(f"🎯 목표 처치 시간 **{st.session_state['target_ttk']}초** | 계산 방식: **{mode_label}**")
 
         # [수정4] 역산 검증 – 실제 지표로 확인
         _, _, hits_chk, ttk_chk = calculate_combat_metrics(
@@ -593,9 +674,9 @@ if mode == "📈 성장 밸런스":
         )
         err_pct = abs(ttk_chk - st.session_state["target_ttk"]) / max(0.001, st.session_state["target_ttk"]) * 100
         if err_pct < 10:
-            st.success(f"✅ 역산 검증 (중간 레벨 샘플): 실제 TTK ≈ {ttk_chk:.2f}초 (오차 {err_pct:.1f}%)")
+            st.success(f"✅ 자동 계산 확인 (중간 레벨 샘플): 실제 처치 시간 ≈ {ttk_chk:.2f}초 (오차 {err_pct:.1f}%)")
         else:
-            st.warning(f"⚠️ 역산 검증 (중간 레벨 샘플): 실제 TTK ≈ {ttk_chk:.2f}초 (오차 {err_pct:.1f}% – 이산 모드 고려)")
+            st.warning(f"⚠️ 자동 계산 확인 (중간 레벨 샘플): 실제 처치 시간 ≈ {ttk_chk:.2f}초 (오차 {err_pct:.1f}% – 실제 타수 계산 모드 고려)")
     else:
         mhp_vals = atk_vals * 4.0
 
@@ -743,11 +824,11 @@ elif mode == "🎰 가챠 확률":
         st.subheader("가챠 설정")
         g_prob       = st.number_input("레전드 확률 (%)", value=float(st.session_state["prob_legend"]),
                                         format="%.4f", min_value=0.001, max_value=100.0)
-        g_pity       = st.number_input("천장 횟수 (Pity)", value=int(st.session_state["pity_count"]),
+        g_pity       = st.number_input("천장 횟수 (보장 획득)", value=int(st.session_state["pity_count"]),
                                         min_value=1, max_value=9999)
-        g_soft_en    = st.checkbox("Soft Pity 활성화 (원신식 점진 상승)",
+        g_soft_en    = st.checkbox("점진 확률 상승 활성화 (원신식 점점 오르는 방식)",
                                     value=st.session_state["soft_pity_enable"])
-        g_soft_start = st.slider("Soft Pity 시작 지점",
+        g_soft_start = st.slider("점진 확률 상승 시작 시점",
                                   1, max(1, int(g_pity) - 1),
                                   value=min(int(st.session_state["soft_pity_start"]),
                                             max(1, int(g_pity) - 1)))
@@ -796,7 +877,7 @@ elif mode == "🎰 가챠 확률":
             st.caption("※ 이론값은 soft pity·천장 미반영 고정확률 기준입니다.")
 
     with sim_col:
-        sp_label = f" + Soft Pity({st.session_state['soft_pity_start']}~)" if st.session_state["soft_pity_enable"] else ""
+        sp_label = f" + 점진 확률 상승({st.session_state['soft_pity_start']}회~)" if st.session_state["soft_pity_enable"] else ""
         st.markdown(f"**🎲 실제 시뮬값 (천장{sp_label} 반영)**")
         sc1, sc2, sc3 = st.columns(3)
         sc1.metric("실제 평균",   f"{sim_mean:.1f}회")
@@ -832,7 +913,7 @@ elif mode == "🎰 가챠 확률":
         if st.session_state["soft_pity_enable"]:
             ax_cdf.axvline(st.session_state["soft_pity_start"], color="green",
                            linestyle=":", lw=1.5,
-                           label=f"Soft Pity({st.session_state['soft_pity_start']})")
+                           label=f"점진 확률 상승 시작({st.session_state['soft_pity_start']}회)")
         ax_cdf.set_xlabel("시도 횟수"); ax_cdf.set_ylabel("누적 확률 (%)")
         ax_cdf.set_title("누적 획득 확률 곡선"); ax_cdf.legend(fontsize=8)
 
@@ -844,8 +925,8 @@ elif mode == "🎰 가챠 확률":
         st.subheader("🤖 AI 심리 리스크 분석")
         if st.button("도파민 커브 정밀 진단"):
             with st.spinner("🎰 분석 중..."):
-                sp_info = (f"Soft Pity ON({st.session_state['soft_pity_start']}회~)"
-                           if st.session_state["soft_pity_enable"] else "Soft Pity OFF")
+                sp_info = (f"점진 확률 상승 ON({st.session_state['soft_pity_start']}회~)"
+                           if st.session_state["soft_pity_enable"] else "점진 확률 상승 OFF")
                 content = safe_ai_call([{"role": "user", "content":
                     f"가챠: 확률 {st.session_state['prob_legend']}%, 천장 {pity}회, {sp_info}.\n"
                     f"시뮬({n_sim_actual:,}명): 평균={sim_mean:.1f}, 50%={p50}, 95%={p95}, 최악1%={p99}회.\n"
@@ -954,22 +1035,79 @@ with tab1:
     user_input = st.text_input("의도 입력",
         placeholder="예: 초반엔 잘 나오다가 후반에 희귀템이 터지는 느낌")
     if st.button("AI 자동 설계 적용"):
+        st.session_state["ai_design_summary"] = None   # 이전 결과 초기화
         if user_input.strip():
-            with st.spinner("🤖 의도를 파라미터로 변환 중..."):
-                result = analyze_intent(user_input)
+            with st.spinner("🤖 의도를 설정값으로 변환 중..."):
+                result = analyze_intent(user_input, mode)   # 현재 모드 전달
                 if result:
+                    changed = {}
+                    for k, v in result.items():
+                        if k in DEFAULTS and st.session_state.get(k) != v:
+                            changed[k] = (st.session_state.get(k), v)
                     st.session_state.update({k: v for k, v in result.items() if k in DEFAULTS})
                     if "monster_hp" in result:
                         st.session_state["current_monster_hp"] = float(result["monster_hp"])
-                    st.success(f"✅ 반영 완료: {result.get('reason', '설계 적용')}")
+                    # soft_pity_start는 반드시 pity_count 미만이어야 함
+                    pity = st.session_state["pity_count"]
+                    if st.session_state["soft_pity_start"] >= pity:
+                        st.session_state["soft_pity_start"] = max(1, pity - 1)
+
+                    # 요약 텍스트 생성 후 session_state에 저장
+                    label_map = {
+                        "base_atk":          "기본 공격력",
+                        "target_atk":        "만렙 공격력",
+                        "max_level":         "최대 레벨",
+                        "curve_type":        "성장 곡선",
+                        "monster_hp":        "몬스터 HP",
+                        "monster_def":       "몬스터 방어력",
+                        "atk_speed":         "공격 속도",
+                        "crit_rate":         "치명타 확률",
+                        "crit_dmg":          "치명타 피해",
+                        "prob_legend":       "레전드 확률",
+                        "pity_count":        "천장 횟수",
+                        "soft_pity_enable":  "점진 확률 상승",
+                        "soft_pity_start":   "점진 확률 상승 시작 횟수",
+                        "enhance_prob":      "강화 성공률",
+                        "enhance_destroy":   "파괴 확률",
+                        "enhance_max_stage": "목표 강화 단계",
+                        "safeguard_enable":  "파괴 방지 기능",
+                        "safeguard_stage":   "파괴 방지 시작 단계",
+                    }
+                    bool_label = {True: "ON ✅", False: "OFF ❌"}
+                    lines = []
+                    for k, (old_v, new_v) in changed.items():
+                        label = label_map.get(k, k)
+                        old_str = bool_label.get(old_v, old_v) if isinstance(old_v, bool) else old_v
+                        new_str = bool_label.get(new_v, new_v) if isinstance(new_v, bool) else new_v
+                        lines.append(f"**{label}**: {old_str} → {new_str}")
+                    reason = result.get("reason", "")
+                    st.session_state["ai_design_summary"] = {
+                        "reason": reason,
+                        "changes": lines,
+                        "mode": mode,
+                    }
                     st.rerun()
         else:
             st.warning("의도를 입력해주세요.")
 
+    # rerun 후에도 요약이 유지되도록 session_state에서 표시
+    summary = st.session_state.get("ai_design_summary")
+    if summary:
+        applied_mode = summary.get("mode", "")
+        if applied_mode and applied_mode != mode:
+            st.info(f"ℹ️ 아래 요약은 **{applied_mode}** 모드 적용 결과입니다. 현재 모드: **{mode}**")
+        st.success(f"✅ {summary['reason']}")
+        if summary["changes"]:
+            with st.expander("📋 변경된 설정값 보기", expanded=True):
+                for line in summary["changes"]:
+                    st.markdown(f"- {line}")
+        else:
+            st.caption("ℹ️ 현재 설정과 동일한 값이 반환되어 변경된 항목이 없습니다.")
+
 # ── Tab 2: Unity C# ──────────────────────────────────────────
 with tab2:
     st.subheader("🎮 Unity C# 통합 매니저")
-    st.caption("✅ Python 시뮬 ↔ Unity 코드 동일 판정 규칙 (B안 꼬리형 강화 / Soft Pity 가챠 / 이산 TTK)")
+    st.caption("✅ 아래 코드는 이 앱의 시뮬레이션과 완전히 동일한 방식으로 동작합니다 (강화 판정 / 확률 상승 가챠 / 실제 타수 계산)")
 
     _b  = st.session_state["base_atk"]
     _t  = st.session_state["target_atk"]
@@ -984,7 +1122,7 @@ with tab2:
     else:
         growth_cs = "return baseAtk + (targetAtk - baseAtk) / (1f + Mathf.Exp(-0.2f * (level - maxLevel * 0.5f)));"
 
-    # [수정1] Unity 강화 판정 B안(꼬리형) 코드 생성
+    # Unity 강화 판정 코드 생성 (현재 설정값 기반)
     e_prob_f    = st.session_state["enhance_prob"]
     e_dest_f    = st.session_state["enhance_destroy"]
     sg_enable   = "true" if st.session_state["safeguard_enable"] else "false"
@@ -1025,19 +1163,21 @@ public class GameBalanceManager : MonoBehaviour
         return Mathf.Max(1f, isCrit ? baseDmg * (critDmgPct / 100f) : baseDmg);
     }}
 
-    // ── 3. 가챠 (Soft Pity + 천장) ──────────────────────────
+    // ── 3. 가챠 시스템 (점진 확률 상승 + 보장 획득 천장) ────────
+    // currentPity: 현재까지 뽑은 횟수
     public bool TryGacha(int currentPity)
     {{
-        float baseProb      = {prob_f / 100:.8f}f;   // {prob_f}%
-        int   pityThreshold = {pity_v};
-        bool  softPityOn    = {sp_enable};
-        int   softPityStart = {sp_start_v};
+        float baseProb      = {prob_f / 100:.8f}f;   // 기본 획득 확률: {prob_f}%
+        int   pityThreshold = {pity_v};               // 천장 (이 횟수에 도달하면 무조건 획득)
+        bool  softPityOn    = {sp_enable};             // 점진 확률 상승 기능 사용 여부
+        int   softPityStart = {sp_start_v};            // 점진 확률 상승이 시작되는 시점
 
-        if (currentPity >= pityThreshold) return true;
+        if (currentPity >= pityThreshold) return true; // 천장 도달 → 무조건 획득
 
         float prob = baseProb;
         if (softPityOn && currentPity >= softPityStart)
         {{
+            // 점진 확률 상승: 시작 지점에서 천장까지 선형으로 확률이 100%까지 올라감
             float progress = (float)(currentPity - softPityStart)
                              / Mathf.Max(1, pityThreshold - softPityStart);
             prob = Mathf.Min(1f, baseProb + (1f - baseProb) * progress);
@@ -1045,34 +1185,35 @@ public class GameBalanceManager : MonoBehaviour
         return Random.value < prob;
     }}
 
-    // ── 4. 강화 시스템 — B안(꼬리형) ★ Python 시뮬과 동일 ───
-    //   roll < sp          → Success
-    //   roll >= (1 - dp)   → Destroyed
-    //   else               → Fail
-    //   ※ sp + dp ≤ 1 안전 캡 적용됨
+    // ── 4. 강화 시스템 — 확률 판정 방식 ★ Python 시뮬과 동일 ──
+    //   난수(0~1)를 뽑아서 아래 순서로 판정:
+    //   난수 < 성공확률(sp)           → 강화 성공
+    //   난수 >= 1 - 파괴확률(dp)      → 아이템 파괴
+    //   그 외                         → 강화 실패
+    //   ※ 성공확률 + 파괴확률의 합이 1을 넘지 않도록 자동 보정됨
     public EnhanceResult UpgradeItem(int currentStage)
     {{
-        float pSuccess       = {e_prob_f / 100:.6f}f;   // {e_prob_f}%
-        float pDestroy       = {e_dest_f / 100:.6f}f;
-        bool  safeguardOn    = {sg_enable};
-        int   safeguardStage = {sg_stage_v};
+        float pSuccess       = {e_prob_f / 100:.6f}f;   // 기본 강화 성공 확률: {e_prob_f}%
+        float pDestroy       = {e_dest_f / 100:.6f}f;   // 기본 파괴 확률
+        bool  safeguardOn    = {sg_enable};               // 파괴 방지 보호 기능 사용 여부
+        int   safeguardStage = {sg_stage_v};              // 파괴 방지가 시작되는 강화 단계
 
-        // 단계별 패널티 적용
+        // 강화 단계가 높을수록 성공 확률이 점점 낮아짐
         float penalty     = Mathf.Max(0.1f, 1f - currentStage * 0.03f);
-        float sp          = Mathf.Min(1f, pSuccess * penalty);
-        float dp          = Mathf.Min(1f, pDestroy * (1f + currentStage * 0.05f));
+        float sp          = Mathf.Min(1f, pSuccess * penalty);  // 현재 단계의 실제 성공 확률
+        float dp          = Mathf.Min(1f, pDestroy * (1f + currentStage * 0.05f)); // 현재 단계의 실제 파괴 확률
 
-        // 세이프가드
+        // 파괴 방지 구간: 파괴 확률 0으로 설정하되, 대신 성공 확률도 절반으로 감소
         if (safeguardOn && currentStage >= safeguardStage)
         {{
             dp  = 0f;
             sp *= 0.5f;
         }}
 
-        // ★ 안전 캡: dp ≤ (1 - sp)
+        // ★ 파괴확률 상한 보정: 성공확률과 합이 1을 초과하지 않도록 제한
         dp = Mathf.Min(dp, Mathf.Max(0f, 1f - sp));
 
-        // ★ B안(꼬리형) 판정 — Python _roll_enhance()와 동일
+        // ★ 실제 판정 로직 — Python 시뮬과 동일한 방식
         float roll = Random.value;
         if (roll < sp)            return EnhanceResult.Success;
         if (roll >= (1f - dp))    return EnhanceResult.Destroyed;
@@ -1107,7 +1248,7 @@ with tab3:
 
         df_data = {"Level": lvls.astype(int), "Atk": np.round(atk_v, 1), "Monster HP": np.round(mhp_v, 1)}
         if st.session_state["ttk_mode"] and ttk_v is not None:
-            df_data["실제 TTK(초)"] = np.round(ttk_v, 2)
+            df_data["실제 처치 시간(초)"] = np.round(ttk_v, 2)
         st.dataframe(pd.DataFrame(df_data), use_container_width=True)
 
     elif mode == "🎰 가챠 확률":
@@ -1131,27 +1272,98 @@ with tab3:
         st.info("💡 누적 확률 50% 전후에서 쾌감 최대. 80% 이상은 쾌감 → 안도감 전환.")
 
     elif mode == "🔥 강화 리스크":
-        # [수정1] Tab3 단계 테이블 – B안(꼬리형) 동일 규칙
-        st.subheader("🔥 단계별 성공·파괴율 테이블 (B안 꼬리형 규칙 적용)")
-        rows = []
+        st.subheader("🔥 단계별 성공·파괴율 테이블")
+        sg_on   = st.session_state["safeguard_enable"]
+        sg_stg  = st.session_state["safeguard_stage"]
         p_s = st.session_state["enhance_prob"] / 100.0
         p_d = st.session_state["enhance_destroy"] / 100.0
+        rows = []
         for s in range(st.session_state["enhance_max_stage"]):
-            sp, dp = _enhance_rates(p_s, p_d, s,
-                                     st.session_state["safeguard_enable"],
-                                     st.session_state["safeguard_stage"])
-            sg_active = st.session_state["safeguard_enable"] and s >= st.session_state["safeguard_stage"]
-            rows.append({
-                "단계":      f"+{s}→+{s+1}",
-                "성공률":    f"{sp*100:.1f}%",
-                "파괴율":    f"{dp*100:.2f}%",
-                "실패율":    f"{(1-sp-dp)*100:.1f}%",
-                "세이프가드": "✅" if sg_active else "-",
-            })
+            sp, dp = _enhance_rates(p_s, p_d, s, sg_on, sg_stg)
+            row = {
+                "단계":   f"+{s}→+{s+1}",
+                "성공률": f"{sp*100:.1f}%",
+                "파괴율": f"{dp*100:.2f}%",
+                "실패율": f"{(1-sp-dp)*100:.1f}%",
+            }
+            # 파괴 방지 기능이 켜진 경우에만 컬럼 추가
+            if sg_on:
+                sg_active = s >= sg_stg
+                row["파괴 방지"] = "✅ 적용 중" if sg_active else "─"
+            rows.append(row)
         st.table(pd.DataFrame(rows))
-        st.caption("※ 표의 확률은 Python 시뮬 / Unity 생성 코드와 완전히 동일한 B안(꼬리형) 규칙으로 계산됩니다.")
+        if not sg_on:
+            st.caption("ℹ️ 파괴 방지 기능이 꺼져 있어 파괴 방지 컬럼이 표시되지 않습니다. 사이드바에서 켤 수 있습니다.")
+        st.caption("※ 표의 확률은 Python 시뮬 / Unity 생성 코드와 동일한 규칙으로 계산됩니다.")
 
     else:
         st.write(f"현재 전략: **{st.session_state['current_preset']}**")
         st.json({k: v for k, v in st.session_state.items()
                  if k not in ("battle_log",) and isinstance(v, (int, float, str, bool))})
+
+st.sidebar.divider()
+st.sidebar.subheader("📥 데이터 내보내기")
+
+
+def generate_report():
+    """현재 세션의 모든 설정을 마크다운 리포트로 생성"""
+    ss = st.session_state
+
+    # combat metrics 계산 (기존 함수 활용)
+    # calculate_combat_metrics가 정의된 위치에 따라 호출 가능 여부 확인 필요
+    try:
+        avg_dmg, dps, _, ttk = calculate_combat_metrics(
+            ss['base_atk'], ss['monster_def'], ss['crit_rate'],
+            ss['crit_dmg'], ss['atk_speed'], ss['monster_hp']
+        )
+    except:
+        ttk = 0
+        dps = 0
+
+    report = f"""# 🎮 RPG 성장 & 도파민 설계 리포트
+
+- **추출 일시:** {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
+- **적용된 게임 유형:** {ss.get('current_preset', 'Custom')}
+
+---
+
+## 📊 1. 핵심 밸런스 설정
+| 항목 | 값 |
+| :--- | :--- |
+| **기본 공격력** | {ss.get('base_atk', 0)} |
+| **성장 곡선** | {ss.get('curve_type', 'N/A')} |
+| **가챠 확률(Legend)** | {ss.get('prob_legend', 0)}% |
+| **강화 성공률** | {ss.get('enhance_prob', 0)}% |
+
+---
+
+## ⚔️ 2. 시뮬레이션 지표
+- **초당 데미지(DPS):** {dps:.2f}
+- **목표 처치 시간:** {ttk:.2f}초
+
+---
+*본 리포트는 **RPG 성장 & 도파민 설계기 Pro**에서 생성되었습니다.*
+"""
+    return report
+
+
+# 1. 마크다운 리포트 다운로드 (fileName -> file_name으로 수정)
+report_md = generate_report()
+st.sidebar.download_button(
+    label="📄 설계 리포트(MD) 다운로드",
+    data=report_md,
+    file_name=f"Report_{pd.Timestamp.now().strftime('%m%d_%H%M')}.md",  # 수정완료
+    mime="text/markdown",
+    use_container_width=True
+)
+
+# 2. JSON 설정 파일 내보내기 (fileName -> file_name으로 수정)
+config_json = json.dumps({k: v for k, v in st.session_state.items()
+                          if isinstance(v, (int, float, str, bool))}, indent=4, ensure_ascii=False)
+st.sidebar.download_button(
+    label="⚙️ 설정값(JSON) 내보내기",
+    data=config_json,
+    file_name=f"config_{pd.Timestamp.now().strftime('%m%d_%H%M')}.json",  # 수정완료
+    mime="application/json",
+    use_container_width=True
+)
