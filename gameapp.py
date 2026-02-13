@@ -27,12 +27,18 @@ from openai import OpenAI
 # 0. 초기 설정
 # ═══════════════════════════════════════════════════════════════
 def set_korean_font():
+    import matplotlib.font_manager as fm
     sys = platform.system()
     if sys == "Windows":
         plt.rc('font', family='Malgun Gothic')
     elif sys == "Darwin":
         plt.rc('font', family='AppleGothic')
     else:
+        # Linux(Streamlit Cloud) – NanumGothic 캐시 갱신
+        font_dirs = ['/usr/share/fonts/truetype/nanum']
+        font_files = fm.findSystemFonts(fontpaths=font_dirs)
+        for f in font_files:
+            fm.fontManager.addfont(f)
         plt.rc('font', family='NanumGothic')
     plt.rcParams['axes.unicode_minus'] = False
 
